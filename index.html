@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0f13">
+<title>Memory Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:opsz,wght@6..96,500&family=Jost:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<style>
+/* One screen: the camera fills it, a reading frame sits in the middle, a panel at the bottom says what is happening. */
+:root {
+  --night: #0d0f13;
+  --paper: #f6f7f9;
+  --muted: #a6adba;
+  --accent: #8fb0ff;
+  --found: #9fe0b4;
+  --display: "Bodoni Moda", "Didot", Georgia, serif;
+  --body: "Jost", "Futura", "Avenir Next", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; margin: 0; }
+body { background: var(--night); color: var(--paper); font-family: var(--body); overflow: hidden; }
+video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; background: var(--night); }
+.shade { position: fixed; inset: 0; pointer-events: none;
+  background: linear-gradient(var(--night) 0, transparent 22%, transparent 70%, var(--night) 100%); opacity: .75; }
+.frame {
+  position: fixed; left: 5%; right: 5%; top: 32%; height: 30%;
+  border-radius: 14px; box-shadow: 0 0 0 100vmax rgba(13, 15, 19, .45);
+  outline: 1.5px solid rgba(246, 247, 249, .85); pointer-events: none;
+}
+.frame::after { /* the line the code should sit on */
+  content: ""; position: absolute; left: 6%; right: 6%; top: 50%; height: 1px; background: var(--accent); opacity: .9;
+}
+.frame.found { outline-color: var(--found); }
+.frame.found::after { background: var(--found); }
+header {
+  position: fixed; top: 0; left: 0; right: 0;
+  padding: calc(env(safe-area-inset-top, 0px) + 18px) max(20px, env(safe-area-inset-right, 0px)) 0 max(20px, env(safe-area-inset-left, 0px));
+}
+.eyebrow { font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin: 0; }
+h1 { font-family: var(--display); font-weight: 500; font-size: 30px; margin: 4px 0 0; }
+.panel {
+  position: fixed; left: 0; right: 0; bottom: 0; display: grid; gap: 12px; justify-items: start;
+  padding: 0 max(20px, env(safe-area-inset-right, 0px)) calc(env(safe-area-inset-bottom, 0px) + 24px) max(20px, env(safe-area-inset-left, 0px));
+}
+#status { margin: 0; font-size: 17px; line-height: 1.4; max-width: 30rem; }
+#code { font-family: var(--mono); font-size: 15px; letter-spacing: .08em; color: var(--found); margin: 0; min-height: 1.3em; }
+.btn {
+  font: 500 16px/1 var(--body); border-radius: 999px; padding: 14px 22px; cursor: pointer;
+  background: var(--paper); color: var(--night); border: 0; text-decoration: none;
+}
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (prefers-reduced-motion: no-preference) {
+  .frame.found { transition: outline-color .2s; }
+}
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<div class="shade"></div>
+<div class="frame" id="frame"></div>
+<header>
+  <p class="eyebrow">Memory &amp; Value</p>
+  <h1>Memory Scanner</h1>
+</header>
+<div class="panel">
+  <p id="status" role="status" aria-live="polite">Starting the camera…</p>
+  <p id="code"></p>
+  <button class="btn" id="start" type="button" hidden>Start the camera</button>
+  <a class="btn" id="open" hidden>Open the memory</a>
+</div>
+
+<script>
+// The library itself stays private on claude.ai; this page only reads the code and sends you there.
+const LIBRARY = "https://claude.ai/artifact/NPFA8sVuGK7TynwQupZnTt";
+const FORMATS = ["code_39", "code_128", "qr_code", "data_matrix"];
+
+const video = document.getElementById("cam");
+const statusEl = document.getElementById("status");
+const codeEl = document.getElementById("code");
+const startBtn = document.getElementById("start");
+const openLink = document.getElementById("open");
+const frameEl = document.getElementById("frame");
+const grab = document.createElement("canvas");
+let native = null, zxing = null, running = false, tick = 0;
+
+const say = (t) => { statusEl.textContent = t; };
+const pretty = (id) => `${id.slice(4, 6)}.${id.slice(2, 4)}.20${id.slice(0, 2)}  ${id.slice(6, 8)}:${id.slice(8, 10)}:${id.slice(10)}`;
+
+async function setUpReaders() {
+  if ("BarcodeDetector" in window) {
+    try {
+      const ok = await BarcodeDetector.getSupportedFormats();
+      const formats = FORMATS.filter((f) => ok.includes(f));
+      if (formats.includes("code_39")) native = new BarcodeDetector({ formats });
+    } catch { native = null; }
+  }
+  if (window.ZXing) {
+    const Z = window.ZXing, hints = new Map();
+    hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [Z.BarcodeFormat.CODE_39, Z.BarcodeFormat.CODE_128, Z.BarcodeFormat.QR_CODE, Z.BarcodeFormat.DATA_MATRIX]);
+    hints.set(Z.DecodeHintType.TRY_HARDER, true);
+    zxing = new Z.MultiFormatReader();
+    zxing.setHints(hints);
+  }
+}
+
+// Only the middle band of the picture is read: that is where the frame on screen asks for the code.
+function middleBand(turn = 0) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const sx = vw * 0.04, sw = vw * 0.92, sy = vh * 0.28, sh = vh * 0.38;
+  const k = Math.min(1, 1400 / sw);
+  const w = Math.round(sw * k), h = Math.round(sh * k);
+  const r = turn * Math.PI / 180;
+  grab.width = w; grab.height = h;
+  const g = grab.getContext("2d", { willReadFrequently: true });
+  g.save(); g.fillStyle = "#fff"; g.fillRect(0, 0, w, h);
+  g.translate(w / 2, h / 2); g.rotate(r);
+  g.drawImage(video, sx, sy, sw, sh, -w / 2, -h / 2, w, h);
+  g.restore();
+  return grab;
+}
+
+function readWithZxing(canvas) {
+  const Z = window.ZXing;
+  try {
+    const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(canvas)));
+    return zxing.decode(bmp).getText();
+  } catch { return null; }
+}
+
+async function look() {
+  if (!running) return;
+  tick++;
+  let text = null;
+  if (video.readyState >= 2) {
+    if (native) {
+      try {
+        const hits = await native.detect(video);
+        if (hits.length) text = hits[0].rawValue;
+      } catch { /* the next frame may work */ }
+    } else if (zxing) {
+      // without a built-in reader, also try the band slightly turned, for a phone held at a small angle
+      const turns = [0, 3, -3, 6, -6];
+      text = readWithZxing(middleBand(turns[tick % turns.length]));
+    }
+  }
+  const id = text && (/\d{12}/.exec(text.replace(/\s/g, "")) || [])[0];
+  if (id) return found(id);
+  setTimeout(look, native ? 90 : 160);
+}
+
+function found(id) {
+  running = false;
+  frameEl.classList.add("found");
+  try { navigator.vibrate && navigator.vibrate(60); } catch { /* optional */ }
+  say("Found it. Opening the memory…");
+  codeEl.textContent = pretty(id);
+  openLink.href = `${LIBRARY}#${id}`;
+  openLink.hidden = false;
+  setTimeout(() => { location.href = openLink.href; }, 700);
+}
+
+async function start() {
+  startBtn.hidden = true;
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    say("The camera only works when this page is opened over https.");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 }, focusMode: "continuous" },
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    if (e && e.name === "NotAllowedError") say("Camera access was refused. Allow the camera for this site in your browser settings, then reload.");
+    else { say("The camera could not start. Tap to try again."); startBtn.hidden = false; }
+    return;
+  }
+  await setUpReaders();
+  if (!native && !zxing) { say("This browser cannot read codes. Try Chrome or Safari."); return; }
+  say("Hold the memory code inside the frame, along the line.");
+  running = true;
+  look();
+}
+
+startBtn.addEventListener("click", start);
+// Some browsers only open the camera after a tap; show the button if the automatic start is blocked.
+start().catch(() => { startBtn.hidden = false; });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) running = false;
+  else if (video.srcObject && !openLink.href) { running = true; look(); }
+});
+</script>
+</body>
+</html>
